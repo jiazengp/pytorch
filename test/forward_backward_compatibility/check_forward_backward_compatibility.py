@@ -85,8 +85,6 @@ ALLOW_LIST = [
     ("aten::linalg_svd_out", datetime.date(2022, 3, 31)),
     ("aten::_max_pool1d_cpu_forward", datetime.date(2022, 2, 8)),
     ("aten::_convolution_nogroup", datetime.date(9999, 1, 1)),
-    ("aten::linspace", datetime.date(2022, 3, 1)),  # TODO this will be removed soon
-    ("aten::logspace", datetime.date(2022, 3, 1)),  # TODO this will be removed soon
     ("aten::miopen_convolution_backward", datetime.date(9999, 1, 1)),
     ("aten::miopen_convolution_backward_bias", datetime.date(9999, 1, 1)),
     ("aten::miopen_convolution_backward_input", datetime.date(9999, 1, 1)),
@@ -139,6 +137,45 @@ dont_parse_list = [
     ("dist_c10d", datetime.date(2099, 9, 17)),
 ]
 
+def has_valid_upgraders(schema, version_map):
+    # we want to parse through the map to find if
+    # the schema has valid upgraders. Since the
+    # version map has entry for each overload
+    # we need to do some ugly parsing.
+
+    # the name of the operator
+    schema_name = schema.name
+
+    if schema_name not in version_map:
+        return False
+
+    entries = version_map[schema_name]
+
+    possible_overloads = []
+    possible_schemas = []
+    for key, upgrader_schema_entries in entries.items():
+        possible_overloads.append(key)
+        possible_schemas.extend(upgrader_schema_entries)
+
+    # let's make sure this existing schema is part of possible
+    # schemas
+    found = False
+    for old_schema in possible_schemas:
+        if old_schema == schema:
+            found = True
+
+    if found:
+        return True
+
+    # this existing schema can be up to date
+    if not found:
+        current_version = torch._C._get_max_operator_version()
+        for overload in possible_overloads:
+            if not torch._C._is_op_symbol_current(overload, current_version):
+                return False
+        return True
+
+    return False
 
 def dont_parse(schema_line):
     for item in dont_parse_list:
@@ -157,13 +194,32 @@ def load_schemas_to_dict():
         new_schema_dict[s.name].append(s)
     return new_schema_dict
 
+def process_version_map(version_map):
+    # version map maps full schema name to
+    # list of upgraders. Since we only have
+    # the name of the schema (aka no overload)
+    # we want to first process the map to make
+    # the key lookup easier. After this it will be:
+    # Dict[schema_name, Dict[overload, List[schema]]]
+
+    output = defaultdict(dict)
+    for (key, entries) in version_map.items():
+        new_key = key.split(".")[0]
+        schema_entries = [parse_schema(entry.old_schema) for entry in entries]
+        output[new_key][key] = schema_entries
+    return output
+
 def check_bc(existing_schemas):
     new_schema_dict = load_schemas_to_dict()
+    version_map = process_version_map(torch._C._get_operator_version_map())
     is_bc = True
     broken_ops = []
     for existing_schema in existing_schemas:
         if allow_listed(existing_schema):
             print("schema: ", str(existing_schema), " found on allowlist, skipping")
+            continue
+        if has_valid_upgraders(existing_schema, version_map):
+            print("schema: ", str(existing_schema), " has valid upgrader, skipping")
             continue
         print("processing existing schema: ", str(existing_schema))
         matching_new_schemas = new_schema_dict.get(existing_schema.name, [])
